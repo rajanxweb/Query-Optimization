@@ -1,7 +1,14 @@
+import os
+import uuid
 from flask import Flask, request, render_template, url_for
 import sqlglot
 from sqlglot import expressions as exp
-import uuid
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from parse import build_ra_tree, visualize_ra_tree, Relation, Selection, Projection, Join, Subquery
 from pred_pushdown import pushdown_selections
@@ -47,14 +54,60 @@ def extract_tree_metrics(node):
     return metrics
 
 def get_db_connection():
-    # Mocking DB connection so it runs without PostgreSQL
-    raise Exception("DB Connection Mocked Out")
+    """
+    Connect to PostgreSQL if credentials are configured in environment variables,
+    otherwise raise an exception to fall back to mock data.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        return psycopg2.connect(db_url)
+
+    db_host = os.environ.get("DB_HOST")
+    if db_host:
+        return psycopg2.connect(
+            host=db_host,
+            port=os.environ.get("DB_PORT", "5432"),
+            dbname=os.environ.get("DB_NAME", "postgres"),
+            user=os.environ.get("DB_USER", "postgres"),
+            password=os.environ.get("DB_PASSWORD", "")
+        )
+    raise Exception("DB Connection not configured in environment (using mock statistics).")
 
 def fetch_table_statistics():
     """
-    Mock table statistics.
+    Fetch live table statistics from PostgreSQL if available, otherwise return mock statistics.
     """
-    return {'t1': 1000, 't2': 500}
+    if os.environ.get("DATABASE_URL") or os.environ.get("DB_HOST"):
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT relname, reltuples::bigint 
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind = 'r' AND n.nspname = 'public';
+            """)
+            stats = {row[0].lower(): max(1, int(row[1])) for row in cur.fetchall()}
+            cur.close()
+            conn.close()
+            if stats:
+                return stats
+        except Exception as e:
+            print(f"Notice: PostgreSQL connection skipped or unavailable ({e}). Falling back to mock data.")
+
+    # Comprehensive mock statistics including test tables and TPC-H schema tables
+    return {
+        't1': 1000,
+        't2': 500,
+        'region': 5,
+        'nation': 25,
+        'supplier': 10000,
+        'customer': 150000,
+        'part': 200000,
+        'partsupp': 800000,
+        'orders': 1500000,
+        'lineitem': 6000000
+    }
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -92,9 +145,13 @@ def joinopt():
 
     try:
         # Perform join optimization on the RA tree
-
         global table_stats
         global current_tree
+
+        if table_stats is None:
+            table_stats = fetch_table_statistics()
+        if current_tree is None and sql:
+            current_tree = build_ra_tree(sql)
     
         estimate_cost(current_tree, table_stats)
         current_tree = join_optimize(current_tree)
@@ -117,6 +174,11 @@ def pushdown():
         # push down selections in the RA tree
         global table_stats
         global current_tree
+
+        if table_stats is None:
+            table_stats = fetch_table_statistics()
+        if current_tree is None and sql:
+            current_tree = build_ra_tree(sql)
 
         estimate_cost(current_tree, table_stats)
         current_tree = pushdown_selections(current_tree)
@@ -146,6 +208,11 @@ def cost():
         global table_stats
         global current_tree
         
+        if table_stats is None:
+            table_stats = fetch_table_statistics()
+        if current_tree is None and sql:
+            current_tree = pushdown_selections(build_ra_tree(sql))
+
         ra_tree = build_ra_tree(sql)
 
         estimate_cost(ra_tree, table_stats)
@@ -201,8 +268,45 @@ def cost():
 @app.route('/schema', methods=['GET'])
 def get_schema_graph():
     """
-    Return a mock schema in DOT format for visualization.
+    Return schema in DOT format for visualization.
+    If database connection is configured, inspect real tables, else return mock schema.
     """
+    if os.environ.get("DATABASE_URL") or os.environ.get("DB_HOST"):
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position;
+            """)
+            rows = cur.fetchall()
+            if rows:
+                tables = {}
+                for tbl, col, dtype in rows:
+                    tables.setdefault(tbl, []).append(f"{col} ({dtype.upper()})")
+                
+                dot_lines = [
+                    "digraph Schema {",
+                    "rankdir=LR;",
+                    "node [shape=box, style=filled, color=lightblue, fontname=Consolas];",
+                    "edge [fontname=Consolas, color=gray];"
+                ]
+                for table_name, columns in tables.items():
+                    dot_lines.append(
+                        f'{table_name} [label=<<B>{table_name.upper()}</B><BR ALIGN="LEFT" />' +
+                        "<BR ALIGN=\"LEFT\" />".join(columns) +
+                        '>, fillcolor=lightyellow];'
+                    )
+                dot_lines.append("}")
+                db_name = os.environ.get("DB_NAME", "PostgreSQL DB")
+                cur.close()
+                conn.close()
+                return {"dot": "\n".join(dot_lines), "dbname": db_name}
+        except Exception as e:
+            print(f"Notice: Could not introspect schema from database ({e}). Using mock schema.")
+
     dot_lines = [
         "digraph Schema {",
         "rankdir=LR;", 
@@ -229,4 +333,6 @@ def get_schema_graph():
     return {"dot": "\n".join(dot_lines), "dbname": "Mock DB"}
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "True").lower() in ("true", "1", "yes")
+    app.run(debug=debug, host='0.0.0.0', port=port)

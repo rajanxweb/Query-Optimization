@@ -2,3 +2,5 @@ flask
 sqlglot
 psycopg2-binary
 graphviz
+python-dotenv
+gunicorn
